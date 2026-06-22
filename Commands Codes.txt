@@ -1,0 +1,37 @@
+Docking:
+# T1 - serial_bridge (wheel odom + drives wheels from /cmd_vel)
+ros2 run serial_bridge serial_bridge --ros-args -p publish_tf:=false
+
+# T2 - safety_monitor (IMU + ultrasonics + /dock_command)
+ros2 run serial_bridge safety_monitor --ros-args -r /safety_stop:=/safety_stop_ultrasonic
+
+# T3 - robot state publisher (needed for TF frames the EKF uses)
+python3 /root/amr_ws/start_rsp.py & sleep 3 && ros2 run joint_state_publisher joint_state_publisher
+
+# T4 - EKF (fused odom -> stable heading/position)
+ros2 run robot_localization ekf_node --ros-args --params-file /root/amr_ws/ekf.yaml
+
+# T5 - rplidar
+ros2 launch rplidar_ros rplidar.launch.py serial_port:=/dev/ttyUSB0 serial_baudrate:=115200
+
+# T6 - laser filter (/scan_filtered)
+ros2 run laser_filters scan_to_scan_filter_chain --ros-args --params-file /root/amr_ws/lidar_filter.yaml -r scan_filtered:=/scan_filtered
+
+# T7 - docking node
+python3 /root/amr_ws/dock_table.py
+
+
+ros2 launch nav2_bringup localization_launch.py map:=/root/amr_ws/my_map_final2.yaml params_file:=/root/amr_ws/amcl_params.yaml use_sim_time:=false
+
+
+ros2 launch /root/amr_ws/navigation_launch.py params_file:=/root/amr_ws/nav2_params.yaml use_sim_time:=false
+
+
+ros2 topic pub --once /dock_command std_msgs/String "data: 'ultimate'"
+
+
+source /opt/ros/jazzy/setup.bash
+export CYCLONEDDS_URI='<CycloneDDS><Domain><General><NetworkInterfaceAddress>100.113.124.97</NetworkInterfaceAddress><AllowMulticast>false</AllowMulticast></General><Discovery><Peers><Peer address="100.78.53.65"/></Peers></Discovery></Domain></CycloneDDS>'
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_DOMAIN_ID=0
+ros2 run rviz2 rviz2 -d ~/amr_rviz.rviz

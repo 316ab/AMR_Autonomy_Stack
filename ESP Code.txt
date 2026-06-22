@@ -1,0 +1,273 @@
+#include <HardwareSerial.h>
+
+// ========================= Hoverboard UART =========================
+HardwareSerial HB(2);
+
+static const uint16_t START_FRAME = 0xABCD;
+static const int HB_RX_PIN = 16;   // ESP32 RX2  <- hoverboard TX
+static const int HB_TX_PIN = 17;   // ESP32 TX2  -> hoverboard RX
+
+typedef struct __attribute__((packed)) {
+  uint16_t start;
+  int16_t  steer;
+  int16_t  speed;
+  uint16_t checksum;
+} Cmd;
+
+typedef struct __attribute__((packed)) {
+  uint16_t start;
+  int16_t  cmd1;
+  int16_t  cmd2;
+  int16_t  speedR_meas;
+  int16_t  speedL_meas;
+  int16_t  batVoltage;
+  int16_t  boardTemp;
+  uint16_t cmdLed;
+  uint16_t checksum;
+} SerialFeedback;
+
+// ========================= Robot geometry =========================
+static const float WHEEL_SEPARATION = 0.272f;   // meters
+static const float WHEEL_RADIUS     = 0.100f;   // meters
+
+// Calibration:
+// real_RPM = RPM_PER_UNIT * firmware_speed_meas_unit
+// Replace this with your measured value.
+static const float RPM_PER_UNIT = 0.58f;
+
+// Command limits to hoverboard firmware
+static const int16_t SPEED_LIMIT = 1000;
+static const int16_t STEER_LIMIT = 1000;
+
+// Flip if robot directions come out reversed
+static const bool INVERT_SPEED = false;
+static const bool INVERT_STEER = false;
+
+// ========================= Timing =========================
+static const unsigned long PI_TIMEOUT_MS        = 300;  // stop if Pi stops sending
+static const unsigned long SEND_PERIOD_MS       = 20;   // 50 Hz to hoverboard
+static const unsigned long FEEDBACK_PRINT_MS    = 50;   // 20 Hz back to Pi
+
+// ========================= State =========================
+volatile int16_t g_speed = 0;
+volatile int16_t g_steer = 0;
+
+unsigned long lastCmdMs      = 0;
+unsigned long lastSendMs     = 0;
+unsigned long lastFeedbackMs = 0;
+
+String serialBuffer = "";
+
+// Hoverboard feedback parser state
+SerialFeedback fb, newFb;
+uint8_t  fbIdx = 0;
+uint16_t bufStartFrame = 0;
+uint8_t  incomingByte = 0;
+uint8_t  incomingBytePrev = 0;
+uint8_t* p = nullptr;
+
+// ========================= Helpers =========================
+static inline int16_t clamp16(int value, int16_t lo, int16_t hi) {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return (int16_t)value;
+}
+
+static inline uint16_t makeChecksum(uint16_t start, int16_t steer, int16_t speed) {
+  return (uint16_t)(start ^ (uint16_t)steer ^ (uint16_t)speed);
+}
+
+// ========================= Hoverboard TX =========================
+void sendCmd(int16_t steer, int16_t speed) {
+  Cmd c;
+  c.start    = START_FRAME;
+  c.steer    = steer;
+  c.speed    = speed;
+  c.checksum = makeChecksum(c.start, c.steer, c.speed);
+  HB.write((uint8_t*)&c, sizeof(c));
+}
+
+// ========================= v,w -> speed,steer =========================
+// Input:
+//   v [m/s]
+//   w [rad/s]
+//
+// Steps:
+// 1) differential drive wheel linear speeds
+// 2) wheel RPM
+// 3) RPM -> firmware units using calibration
+// 4) right/left -> hoverboard speed/steer
+void cmdVelToHoverboard(float v, float w, int16_t &out_speed, int16_t &out_steer) {
+  // 1) Wheel linear velocities [m/s]
+  float v_right = v + (WHEEL_SEPARATION * 0.5f) * w;
+  float v_left  = v - (WHEEL_SEPARATION * 0.5f) * w;
+
+  // 2) Convert to wheel RPM
+  const float MPS_TO_RPM = 60.0f / (2.0f * 3.14159265359f * WHEEL_RADIUS);
+  float rpm_right = v_right * MPS_TO_RPM;
+  float rpm_left  = v_left  * MPS_TO_RPM;
+
+  // 3) Convert RPM -> hoverboard firmware units
+  float u_right = rpm_right / RPM_PER_UNIT;
+  float u_left  = rpm_left  / RPM_PER_UNIT;
+
+  // 4) Convert right/left into hoverboard speed/steer
+  float speed_f = 0.5f * (u_right + u_left);
+  float steer_f = 0.5f * (u_right - u_left);
+
+  if (INVERT_SPEED) speed_f = -speed_f;
+  if (INVERT_STEER) steer_f = -steer_f;
+
+  out_speed = clamp16((int)speed_f, -SPEED_LIMIT, SPEED_LIMIT);
+  out_steer = clamp16((int)steer_f, -STEER_LIMIT, STEER_LIMIT);
+}
+
+// ========================= Serial input from Pi =========================
+// Expected format:
+//   v,w\n
+// Example:
+//   0.25,0.40\n
+void parsePiLine(const String& line) {
+  int comma = line.indexOf(',');
+  if (comma < 0) return;
+
+  float v = line.substring(0, comma).toFloat();
+  float w = line.substring(comma + 1).toFloat();
+
+  int16_t spd, str;
+  cmdVelToHoverboard(v, w, spd, str);
+
+  g_speed = spd;
+  g_steer = str;
+  lastCmdMs = millis();
+
+  Serial.print("CMD,");
+  Serial.print(v, 3);
+  Serial.print(",");
+  Serial.print(w, 3);
+  Serial.print(",");
+  Serial.print(g_speed);
+  Serial.print(",");
+  Serial.println(g_steer);
+}
+
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      serialBuffer.trim();
+      if (serialBuffer.length() > 0) {
+        parsePiLine(serialBuffer);
+      }
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+      if (serialBuffer.length() > 64) {
+        serialBuffer = "";
+      }
+    }
+  }
+}
+
+// ========================= Hoverboard feedback RX =========================
+bool receiveFeedback() {
+  while (HB.available()) {
+    incomingByte = (uint8_t)HB.read();
+    bufStartFrame = ((uint16_t)incomingByte << 8) | incomingBytePrev;
+
+    if (bufStartFrame == START_FRAME) {
+      p = (uint8_t*)&newFb;
+      *p++ = incomingBytePrev;
+      *p++ = incomingByte;
+      fbIdx = 2;
+    } else if (fbIdx >= 2 && fbIdx < sizeof(SerialFeedback)) {
+      *p++ = incomingByte;
+      fbIdx++;
+    }
+
+    if (fbIdx == sizeof(SerialFeedback)) {
+      uint16_t checksum =
+        (uint16_t)(newFb.start ^ newFb.cmd1 ^ newFb.cmd2 ^
+                   newFb.speedR_meas ^ newFb.speedL_meas ^
+                   newFb.batVoltage ^ newFb.boardTemp ^ newFb.cmdLed);
+
+      fbIdx = 0;
+
+      if (newFb.start == START_FRAME && checksum == newFb.checksum) {
+        memcpy(&fb, &newFb, sizeof(SerialFeedback));
+        incomingBytePrev = incomingByte;
+        return true;
+      }
+    }
+
+    incomingBytePrev = incomingByte;
+  }
+
+  return false;
+}
+
+// ========================= Feedback to Pi =========================
+// Output format:
+//   FB,speedR_meas,speedL_meas,rpmR,rpmL,bat,temp
+void sendFeedbackToPi() {
+  float rpmR = fb.speedR_meas * RPM_PER_UNIT;
+  float rpmL = fb.speedL_meas * RPM_PER_UNIT;
+
+  Serial.print("FB,");
+  Serial.print(fb.speedR_meas);
+  Serial.print(",");
+  Serial.print(fb.speedL_meas);
+  Serial.print(",");
+  Serial.print(rpmR, 2);
+  Serial.print(",");
+  Serial.print(rpmL, 2);
+  Serial.print(",");
+  Serial.print(fb.batVoltage);
+  Serial.print(",");
+  Serial.println(fb.boardTemp);
+}
+
+// ========================= Setup =========================
+void setup() {
+  Serial.begin(115200);                                  // USB serial to Pi
+  HB.begin(115200, SERIAL_8N1, HB_RX_PIN, HB_TX_PIN);   // Hoverboard USART2
+
+  g_speed = 0;
+  g_steer = 0;
+  lastCmdMs = 0;
+  lastSendMs = 0;
+  lastFeedbackMs = 0;
+
+  Serial.println("ESP32 Hoverboard Serial Bridge Ready");
+  Serial.println("Input format: v,w");
+  Serial.println("Example: 0.20,0.00");
+  Serial.println("Feedback format: FB,speedR,speedL,rpmR,rpmL,bat,temp");
+}
+
+// ========================= Main loop =========================
+void loop() {
+  handleSerialInput();
+
+  // Dead-man stop
+  if (millis() - lastCmdMs > PI_TIMEOUT_MS) {
+    g_speed = 0;
+    g_steer = 0;
+  }
+
+  // Continuous command stream to hoverboard
+  if (millis() - lastSendMs >= SEND_PERIOD_MS) {
+    lastSendMs = millis();
+    sendCmd(g_steer, g_speed);
+  }
+
+  // Parse and forward feedback
+  if (receiveFeedback()) {
+    if (millis() - lastFeedbackMs >= FEEDBACK_PRINT_MS) {
+      lastFeedbackMs = millis();
+      sendFeedbackToPi();
+    }
+  }
+}
